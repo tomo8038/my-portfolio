@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>資產存摺 · My Portfolio</title>
+<style>
+/* ===== 資產存摺 — 銀行存摺帳本風 =====
+   紙:灰綠存摺紙;墨:深墨綠;格線:細淡綠;
+   數字:等寬印字(像存摺補登的字);台股紅漲為預設。 */
+:root{
+  --paper:#F1F3EE; --band:#E5EAE2; --line:#C9D1C6;
+  --ink:#1C2620; --muted:#6B7A6E;
+  --brand:#173B2C; --brand-ink:#EAF2EC;
+  --up:#C9342B; --down:#1E7A4E; --link:#3D6B9E;
+  --mono:"IBM Plex Mono","Noto Sans Mono",ui-monospace,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:15px/1.6 "Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+code{font-family:var(--mono);background:var(--band);padding:0 4px;border-radius:3px}
+.up-tw{color:var(--up)} .down-tw{color:var(--down)}
+.muted{color:var(--muted);font-size:13px}
+.loading{padding:80px;text-align:center;color:var(--muted)}
+
+/* 頂列 */
+.topbar{background:var(--brand);color:var(--brand-ink);
+  display:flex;justify-content:space-between;align-items:center;
+  padding:14px 26px;border-bottom:3px double #0E2A1E}
+.topbar h1{margin:0;font-size:21px;letter-spacing:.06em}
+.topbar h1 small{font-weight:400;opacity:.65;font-size:13px;margin-left:8px}
+.topbar .ts{font-size:12px;opacity:.7;font-family:var(--mono)}
+.scheme-btn{background:transparent;color:var(--brand-ink);cursor:pointer;
+  border:1px solid rgba(234,242,236,.45);border-radius:4px;
+  padding:7px 14px;font-size:13px}
+.scheme-btn:hover{background:rgba(234,242,236,.12)}
+
+/* 即時跑馬燈(signature) */
+.tape{background:#0E2A1E;color:#D7E4DA;overflow:hidden;white-space:nowrap;
+  font-family:var(--mono);font-size:13px;padding:6px 0;
+  border-bottom:1px solid var(--line)}
+.tape.idle{padding:6px 26px;color:#9FB3A5}
+.tape-track{display:inline-block;animation:tape 26s linear infinite}
+.tape-item{margin:0 22px}
+.tape-item i{font-style:normal}
+@keyframes tape{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@media (prefers-reduced-motion: reduce){.tape-track{animation:none}}
+
+main{max-width:1180px;margin:0 auto;padding:22px 26px 40px}
+
+/* 存摺式 KPI:一行一筆,像補登的存摺紀錄 */
+.passbook{background:#FBFCFA;border:1px solid var(--line);border-radius:6px;
+  margin-bottom:22px;
+  background-image:repeating-linear-gradient(transparent,transparent 47px,
+    var(--line) 47px,var(--line) 48px)}
+.pb-row{display:flex;justify-content:space-between;align-items:center;
+  height:48px;padding:0 22px}
+.pb-row.perf{background:var(--band)}
+.pb-label{font-size:14px;color:var(--muted);letter-spacing:.08em}
+.pb-label em{font-style:normal;font-size:12px;color:var(--link)}
+.live-dot{font-style:normal;color:var(--link)}
+.pb-num{font-family:var(--mono);font-size:21px;font-weight:600;
+  font-variant-numeric:tabular-nums;letter-spacing:.02em}
+
+/* 卡片 */
+.card{background:#FBFCFA;border:1px solid var(--line);border-radius:6px;
+  padding:16px 20px 14px;margin-bottom:22px}
+.card header{display:flex;justify-content:space-between;align-items:baseline;
+  flex-wrap:wrap;gap:6px;margin-bottom:10px;
+  border-bottom:1px solid var(--line);padding-bottom:8px}
+.card h2{margin:0;font-size:15px;letter-spacing:.14em;color:var(--brand)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+@media(max-width:880px){.grid2{grid-template-columns:1fr}}
+
+/* 配置維度切換 */
+.dim-tabs button{background:transparent;border:1px solid var(--line);
+  border-radius:3px;margin-left:6px;padding:4px 12px;cursor:pointer;
+  font-size:13px;color:var(--muted)}
+.dim-tabs button.on{background:var(--brand);color:var(--brand-ink);
+  border-color:var(--brand)}
+.legend{list-style:none;margin:6px 0 0;padding:0;display:flex;
+  flex-wrap:wrap;gap:4px 18px;font-size:13px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;
+  margin-right:6px;vertical-align:baseline}
+
+/* 持倉帳本表 */
+.ledger{width:100%;border-collapse:collapse;font-size:14px}
+.ledger th{font-weight:600;color:var(--muted);letter-spacing:.08em;
+  border-bottom:2px solid var(--line);padding:8px 10px;text-align:left}
+.ledger td{border-bottom:1px solid var(--line);padding:9px 10px}
+.ledger .num{text-align:right;font-family:var(--mono);
+  font-variant-numeric:tabular-nums}
+.ledger tbody tr:hover{background:var(--band)}
+footer{margin-top:6px;text-align:center}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="app.js"></script>
+</body>
+</html>

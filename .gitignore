@@ -1,0 +1,6 @@
+.env
+*.db
+*.pfx
+__pycache__/
+*.log
+node_modules/

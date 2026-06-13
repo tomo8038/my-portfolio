@@ -40,11 +40,34 @@ def _find_positions_table(cur):
     return None
 
 
+_DAILY_VALUE_COLS = ["net_worth", "networth", "nav", "market_value",
+                     "value", "total_value"]
+
+
 def _find_daily_table(cur):
+    """回傳 (表名, 日期欄, 市值欄);找不到回 (None, None, None)。"""
     for t in _tables(cur):
         c = set(_cols(cur, t))
-        if "date" in c and "networth" in c:
-            return t
+        if "date" in c:
+            for vc in _DAILY_VALUE_COLS:
+                if vc in c:
+                    return t, "date", vc
+    return None, None, None
+
+
+def _find_snapshot(cur):
+    """快照表(market 口徑的當前淨值/現金/成本)。回傳 dict 或 None。"""
+    for t in _tables(cur):
+        c = set(_cols(cur, t))
+        if "net_worth" in c and "cash" in c:   # 通常為 snapshots
+            row = cur.execute(
+                f"SELECT net_worth, cash, "
+                f"{'invested' if 'invested' in c else 'net_worth'}, "
+                f"{'cost' if 'cost' in c else 'net_worth'} FROM {t} LIMIT 1"
+            ).fetchone()
+            if row:
+                return dict(net_worth=row[0], cash=row[1],
+                            invested=row[2], cost=row[3])
     return None
 
 
@@ -76,7 +99,9 @@ def load_account(db_path: str) -> dict:
             if abs(q) > 1e-6:
                 positions.append((s, q, c if cb == "cost_basis" else c * q))
 
-    dtab = _find_daily_table(cur)
+    snap = _find_snapshot(cur)
+
+    dtab, dcol, vcol = _find_daily_table(cur)
     daily = {}
     cash_from_daily = None
     if dtab:
@@ -84,20 +109,26 @@ def load_account(db_path: str) -> dict:
         where = " WHERE broker=?" if "broker" in cols else ""
         cashcol = ", cash" if "cash" in cols else ""
         rows = cur.execute(
-            f"SELECT date, networth{cashcol} FROM {dtab}{where} ORDER BY date",
+            f"SELECT {dcol}, {vcol}{cashcol} FROM {dtab}{where} ORDER BY {dcol}",
             ((broker,) if where else ())).fetchall()
         for r in rows:
             daily[r[0]] = r[1]
         if "cash" in cols and rows:
             cash_from_daily = rows[-1][2]
 
-    cash = float(meta["cash"]) if "cash" in meta else (cash_from_daily or 0.0)
+    # 現金優先序:meta → snapshots → daily 末日
+    if "cash" in meta:
+        cash = float(meta["cash"])
+    elif snap is not None:
+        cash = float(snap["cash"])
+    else:
+        cash = cash_from_daily or 0.0
     realized = float(meta["realized"]) if "realized" in meta else None
 
     con.close()
     return dict(db=db_path, broker=broker, positions=positions,
                 cash=cash, realized=realized, daily=daily,
-                ptab=ptab, dtab=dtab)
+                ptab=ptab, dtab=dtab, vcol=vcol, snap=snap)
 
 
 def combine(dbs: list[str], by_symbol: bool):
@@ -113,16 +144,25 @@ def combine(dbs: list[str], by_symbol: bool):
     for a in accts:
         pos_cost = sum(c for _, _, c in a["positions"])
         last_day = max(a["daily"]) if a["daily"] else None
-        nw = a["daily"][last_day] if last_day else (a["cash"] + pos_cost)
+        # 期末淨值優先序:snapshots 市值 → daily 末日 → 成本遞補
+        if a.get("snap") is not None:
+            nw = float(a["snap"]["net_worth"]); src = "snapshots"
+        elif last_day is not None:
+            nw = a["daily"][last_day]; src = f"daily:{last_day}"
+        else:
+            nw = a["cash"] + pos_cost; src = "成本遞補"
+        a["_final_src"] = src
         grand_cash += a["cash"]
         grand_mkt += nw
         per_broker_final[a["broker"]] = (last_day, nw)
         print(f"\n● {a['broker']}  ({a['db']})")
-        print(f"    schema: 持倉表={a['ptab']}  每日表={a['dtab']}")
+        print(f"    schema: 持倉表={a['ptab']}  每日表={a['dtab']}({a.get('vcol')})  快照={'有' if a.get('snap') else '無'}")
         print(f"    持倉 {len(a['positions'])} 檔,成本合計 ${pos_cost:,.2f}")
         print(f"    現金 ${a['cash']:,.2f}"
               + (f" · 已實現 ${a['realized']:,.2f}" if a['realized'] is not None else ""))
-        print(f"    期末淨值({last_day}) ${nw:,.2f}  ← 對這個數字跟券商 App 顯示的帳戶價值")
+        mkt_note = "市值" if a["_final_src"] != "成本遞補" else "成本遞補(需抓真實價)"
+        print(f"    期末淨值 ${nw:,.2f}  [{mkt_note}/來源 {a['_final_src']}]"
+              f"  ← 對這個數字跟券商 App 顯示的帳戶價值")
 
     # 合併持倉(同檔跨券商:股數相加、成本相加)
     if by_symbol:

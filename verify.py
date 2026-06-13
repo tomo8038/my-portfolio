@@ -1,24 +1,72 @@
-"""schwab.db 對帳驗證 — P4b。
+"""schwab.db 對帳驗證 — P4b(v3:獨立重播版)。
 
-獨立於 build_history.py 重新核對數字,確認重建沒有漏算/重算。
-本機抓到真實市價後,「報酬分解」也會吻合(成本遞補時未實現=0,該式不適用)。
+獨立於 build_history.py 重新核對,確認重建沒有漏算/重算。
+
+修正歷程:
+  v1 [2] 比「現金+成本 == 淨值」→ 本機抓真實價後差一個未實現,誤報。
+  v2 [2] 改市值自洽;新增 [5] 收益分類守恆 → 但漏算「實物轉撥(Security Transfer/
+     Journal)」這項外部資本,帳戶有轉股(如 QLD 轉去 IBKR)時 [5] 會差一個轉撥成本。
+  v3 [5] 改為「從 CSV 獨立重播」算出 持倉成本 與 已實現,直接對 DB:
+     轉撥用當時加權均價處理,轉入/轉出都自動正確,不再依賴收益/轉撥分類。
+
+四+一項檢查:
+  [1] 現金     :CSV 全部 Amount 加總 == 快照現金
+  [2] 市值自洽 :淨值 == 現金 + 持倉市值(invested)        ← 與抓價無關
+  [3] 持股     :CSV 獨立重算 == positions_current
+  [4] 每日無缺日
+  [5] 成本/已實現:CSV 獨立重播之 持倉成本、已實現 == DB   ← 與市價、與轉撥皆無關
+  [分解] 純呈現:淨值 = 淨入金 + 已實現 + 收益淨額 + 實物轉撥 + 未實現
 
 用法:python verify.py schwab.db schwab.csv
 """
 import csv
 import sqlite3
 import sys
+from collections import defaultdict
+from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
+
+D0 = Decimal(0)
+
+SHARE_TRADE_ACTIONS = {"Buy", "Sell", "Reinvest Shares", "Stock Split"}
+TRANSFER_ACTIONS = {"Journal", "Security Transfer", "Internal Transfer",
+                    "Journaled Shares"}
+EXTERNAL_CASH_ACTIONS = {"Wire Received", "Wire Sent", "MoneyLink Deposit",
+                         "MoneyLink Transfer", "Deposit", "Withdrawal",
+                         "Withdraw", "Cash Transfer"}
+# 其餘(各類 Dividend / Credit Interest / 各種 Tax / Fee / Cash In Lieu …)= 收益淨額
 
 
 def _money(s):
     s = (s or "").strip().replace("$", "").replace(",", "").replace('"', "")
     if not s:
-        return Decimal(0)
+        return D0
     neg = s.startswith("-")
     s = s.lstrip("-")
-    return (Decimal("-1") if neg else Decimal(1)) * Decimal(s) if s else Decimal(0)
+    return (Decimal("-1") if neg else Decimal(1)) * Decimal(s) if s else D0
+
+
+def _qty(s):
+    s = (s or "0").replace(",", "").strip()
+    return Decimal(s) if s else D0
+
+
+def _parse_date(s):
+    s = (s or "").split(" as of ")[0].strip()[:10]
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _read_rows(csv_path):
+    with open(csv_path, encoding="utf-8-sig") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("Date")]
+    # 依日期升冪(均價重播需時間序);無法解析的維持原序末端
+    rows.sort(key=lambda r: (_parse_date(r["Date"]) or date.max))
+    return rows
 
 
 def main():
@@ -26,78 +74,105 @@ def main():
     csv_path = sys.argv[2] if len(sys.argv) > 2 else "schwab.csv"
     con = sqlite3.connect(db)
     ok = True
+    rows = _read_rows(csv_path)
 
-    # ---- 驗證 1:CSV 全部 Amount 加總 = 快照現金 ----
-    with open(csv_path, encoding="utf-8-sig") as f:
-        csv_cash = sum(_money(r["Amount"]) for r in csv.DictReader(f)
-                       if r.get("Date"))
-    db_cash = Decimal(str(con.execute(
-        "SELECT cash FROM snapshots").fetchone()[0]))
+    # ---- [1] 現金 ----
+    csv_cash = sum((_money(r["Amount"]) for r in rows), D0)
+    db_cash = Decimal(str(con.execute("SELECT cash FROM snapshots").fetchone()[0]))
     d1 = abs(csv_cash - db_cash)
     print(f"[1] CSV Amount 加總 ${csv_cash:,.2f}  vs  快照現金 ${db_cash:,.2f}"
           f"  → 差 ${d1:.4f}  {'✓' if d1 < Decimal('0.01') else '✗'}")
     ok &= d1 < Decimal("0.01")
 
-    # ---- 驗證 2:現金 + 持倉成本 = 淨值(成本基礎守恆)----
+    # ---- [2] 市值自洽 ----
     nw, inv, cost = con.execute(
         "SELECT net_worth, invested, cost FROM snapshots").fetchone()
-    # 成本基礎下 invested==cost(現價=均價);市值口徑下兩者不同
-    d2 = abs(Decimal(str(nw)) - (db_cash + Decimal(str(cost))))
-    print(f"[2] 現金+持倉成本 ${db_cash + Decimal(str(cost)):,.2f}  vs  "
-          f"淨值 ${nw:,.2f}  → 差 ${d2:.4f}  {'✓' if d2 < Decimal('1') else '✗'}")
+    nw, inv, cost = Decimal(str(nw)), Decimal(str(inv)), Decimal(str(cost))
+    d2 = abs(nw - (db_cash + inv))
+    print(f"[2] 淨值 ${nw:,.2f}  vs  現金+持倉市值 ${db_cash + inv:,.2f}"
+          f"  → 差 ${d2:.4f}  {'✓' if d2 < Decimal('1') else '✗'}")
     ok &= d2 < Decimal("1")
 
-    # ---- 驗證 3:持股非負,且與 CSV 獨立重算一致 ----
-    from collections import defaultdict
-    pos = defaultdict(Decimal)
-    with open(csv_path, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sym = r["Symbol"].strip()
-            if not sym:
-                continue
-            q = Decimal((r["Quantity"] or "0").replace(",", "") or "0")
-            a = r["Action"]
-            if a in ("Buy", "Reinvest Shares", "Stock Split"):
-                pos[sym] += q
-            elif a == "Sell":
-                pos[sym] -= q
-            elif a in ("Journal", "Security Transfer"):
-                pos[sym] += q
-    csv_pos = {s: v for s, v in pos.items() if abs(v) > Decimal("0.0001")}
-    db_pos = {s: Decimal(str(q)) for s, q in con.execute(
+    # ---- 獨立重播(供 [3][5] 與分解共用)----
+    qty = defaultdict(lambda: D0)
+    cost_lot = defaultdict(lambda: D0)        # 各檔總成本
+    realized = D0
+    dep = D0                                   # 外部現金淨入金
+    income = D0                                # 收益淨額(股息/利息/稅費…)
+    inkind = D0                                # 實物轉撥成本基礎淨額
+
+    def avg(sym):
+        return cost_lot[sym] / qty[sym] if qty[sym] else D0
+
+    for r in rows:
+        a = (r.get("Action") or "").strip()
+        sym = (r.get("Symbol") or "").strip()
+        q = _qty(r.get("Quantity"))
+        amt = _money(r.get("Amount"))
+        if a in ("Buy", "Reinvest Shares"):
+            qty[sym] += q; cost_lot[sym] += -amt
+        elif a == "Stock Split":
+            qty[sym] += q                       # 加股、成本不變
+        elif a == "Sell":
+            removed = avg(sym) * q
+            realized += amt - removed
+            qty[sym] -= q; cost_lot[sym] -= removed
+        elif a in TRANSFER_ACTIONS:
+            # 實物轉撥:用 CSV Amount 為成本基礎;若空,轉出(q<0)以當時均價估
+            basis = amt if amt != 0 else (avg(sym) * q if q else D0)
+            qty[sym] += q
+            cost_lot[sym] += basis
+            inkind += basis
+        elif a in EXTERNAL_CASH_ACTIONS:
+            dep += amt
+        else:
+            income += amt                       # 收益淨額(排除法)
+
+    re_cost = sum((c for s, c in cost_lot.items()
+                   if abs(qty[s]) > Decimal("0.0001")), D0)
+
+    # ---- [3] 持股 ----
+    csv_pos = {s: v for s, v in qty.items() if abs(v) > Decimal("0.0001")}
+    db_pos = {s: Decimal(str(qd)) for s, qd in con.execute(
         "SELECT symbol, qty FROM positions_current")}
-    mismatch = []
-    for s in set(csv_pos) | set(db_pos):
-        if abs(csv_pos.get(s, Decimal(0)) - db_pos.get(s, Decimal(0))) > Decimal("0.01"):
-            mismatch.append(s)
+    mismatch = [s for s in set(csv_pos) | set(db_pos)
+                if abs(csv_pos.get(s, D0) - db_pos.get(s, D0)) > Decimal("0.01")]
     print(f"[3] 持股獨立重算:CSV {len(csv_pos)} 檔 vs DB {len(db_pos)} 檔"
           f"  → 不符 {mismatch or '無'}  {'✓' if not mismatch else '✗'}")
     ok &= not mismatch
 
-    # ---- 驗證 4:每日淨值連續、無缺日 ----
+    # ---- [4] 每日無缺日 ----
     days = [r[0] for r in con.execute(
         "SELECT date FROM daily_networth ORDER BY date")]
-    from datetime import date
     gaps = 0
     if days:
-        a = date.fromisoformat(days[0]); b = date.fromisoformat(days[-1])
-        expect = (b - a).days + 1
-        gaps = expect - len(days)
+        a0 = date.fromisoformat(days[0]); b0 = date.fromisoformat(days[-1])
+        gaps = (b0 - a0).days + 1 - len(days)
     print(f"[4] 每日淨值 {len(days)} 天({days[0]}~{days[-1]})"
           f"  缺 {gaps} 天  {'✓' if gaps == 0 else '✗'}")
     ok &= gaps == 0
 
-    # ---- 報酬分解(市值口徑才適用;成本遞補時僅供參考)----
-    dep = con.execute("SELECT COALESCE(SUM(amount),0) FROM transactions "
-                      "WHERE txn_type IN ('DEPOSIT','WITHDRAW')").fetchone()[0]
-    realized = con.execute("SELECT COALESCE(SUM(pnl),0) "
-                           "FROM realized_pnl").fetchone()[0]
+    # ---- [5] 獨立重播之 成本 / 已實現 == DB ----
+    db_realized = Decimal(str(con.execute(
+        "SELECT COALESCE(SUM(pnl),0) FROM realized_pnl").fetchone()[0]))
+    dc = abs(re_cost - cost)
+    dr = abs(realized - db_realized)
+    p5 = dc < Decimal("1") and dr < Decimal("1")
+    print(f"[5] 獨立重播 持倉成本 ${re_cost:,.2f} vs DB ${cost:,.2f}(差 ${dc:.2f})"
+          f" · 已實現 ${realized:,.2f} vs DB ${db_realized:,.2f}(差 ${dr:.2f})"
+          f"  {'✓' if p5 else '✗'}")
+    ok &= p5
+
+    # ---- [分解] 純呈現 ----
     unreal = inv - cost
-    print(f"\n[參考] 報酬分解(本機有真實市價時應吻合):")
-    print(f"       淨入金 ${dep:,.2f} + 已實現 ${realized:,.2f} "
-          f"+ 未實現 ${unreal:,.2f} + 配息淨額")
-    print(f"       未實現 = ${unreal:,.2f}"
-          f"{'(成本遞補,故為 0;本機抓價後會有值)' if abs(unreal) < 1 else ''}")
+    lhs = db_cash + cost
+    print(f"\n[分解] 現金+成本 ${lhs:,.2f} = 淨入金 ${dep:,.2f} + 已實現 "
+          f"${db_realized:,.2f} + 收益淨額 ${income:,.2f} + 實物轉撥 ${inkind:,.2f}")
+    chk_cost = dep + db_realized + income + inkind
+    print(f"       右側合計 ${chk_cost:,.2f}"
+          f"  {'✓ 吻合' if abs(chk_cost - lhs) < Decimal('1') else '✗'}")
+    print(f"       淨值 ${nw:,.2f} = 上式 + 未實現 ${unreal:,.2f}"
+          + ("(成本遞補:未實現=0)" if abs(unreal) < 1 else ""))
 
     con.close()
     print("\n" + ("✅ 全部守恆驗證通過" if ok else "❌ 有驗證未通過,請檢查"))

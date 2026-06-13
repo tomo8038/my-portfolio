@@ -1,9 +1,4 @@
-shioaji
-streamlit
+# IBKR CSV 回放工具組(P4c)
 pandas
-yfinance
-altair
-# React 專業版(選用):
-fastapi
-uvicorn
-requests
+streamlit
+yfinance        # build_history_ibkr.py 抓歷史收盤(無網路會自動成本遞補)

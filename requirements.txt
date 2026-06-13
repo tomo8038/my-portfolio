@@ -6,3 +6,4 @@ altair
 # React 專業版(選用):
 fastapi
 uvicorn
+requests

@@ -1,42 +1,22 @@
-"""歷史價格服務 — 回補引擎的燃料。
-
-來源:yfinance(免費、免認證)。台股代號自動映射:2330 → 2330.TW(上市),
-查不到再試 .TWO(上櫃)。
-
-兩個關鍵設計:
-
-1) 快取優先:抓過的 (symbol, date) 收盤價存進 SQLite price_cache,
-   之後開機直接讀本地,離線也能回補已快取的區間。
-
-2) 拆股調整(split-only):回補是「今天的股數 × 當天價格」,
-   若中間發生過股票分割(例:0050 在 2025 年 1 拆 4),
-   分割前的原始價格是分割後的 4 倍,直接相乘會把淨值灌水 4 倍。
-   修正:把分割「之前」的價格除以之後發生的分割倍數
-   (今天股數 × 調整價 = 當時股數 × 當時原始價 = 正確市值)。
-   注意只調拆股、不調股息 — 股息調整會把過去價格壓低,低估歷史淨值。
-"""
+"""歷史價格服務 — 回補引擎的燃料。(測試重建版)"""
 from datetime import date, datetime, timedelta
 
 
 class PriceService:
     def __init__(self, db):
         self.db = db
-        self._mem: dict[str, dict[str, float]] = {}   # symbol -> {date: close}
-
-    # ---------- 對外 ----------
+        self._mem: dict[str, dict[str, float]] = {}
 
     def ensure_range(self, symbol: str, ccy: str, start: str, end: str) -> None:
-        """確保 [start, end] 的每日收盤已在快取;缺的才上網抓。"""
         cached = self._load(symbol)
         if cached and min(cached) <= start and max(cached) >= end:
-            return  # 區間已涵蓋
+            return
         fetched = self._fetch(symbol, ccy, start, end)
         if fetched:
             self.db.put_prices(symbol, ccy, fetched)
-            self._mem.pop(symbol, None)  # 失效,下次重讀
+            self._mem.pop(symbol, None)
 
     def close_on(self, symbol: str, d: str) -> float | None:
-        """d 當天收盤價;非交易日/無資料 → 往前找最近一個(最多 10 天)。"""
         prices = self._load(symbol)
         if not prices:
             return None
@@ -50,8 +30,6 @@ class PriceService:
                 return prices[key]
         return None
 
-    # ---------- 內部 ----------
-
     def _load(self, symbol: str) -> dict[str, float]:
         if symbol not in self._mem:
             self._mem[symbol] = self.db.get_prices(symbol)
@@ -59,17 +37,14 @@ class PriceService:
 
     def _fetch(self, symbol: str, ccy: str,
                start: str, end: str) -> list[tuple[str, float]]:
-        """從 yfinance 抓原始收盤 + 拆股事件,做 split-only 調整。"""
         try:
             import yfinance as yf
         except ImportError:
             print("[prices] 未安裝 yfinance(pip install yfinance),"
                   "僅能使用已快取的價格")
             return []
-
         end_plus = (datetime.strptime(end, "%Y-%m-%d").date()
-                    + timedelta(days=1)).isoformat()   # yfinance end 不含當日
-
+                    + timedelta(days=1)).isoformat()
         for ticker in self._candidates(symbol, ccy):
             try:
                 df = yf.Ticker(ticker).history(
@@ -80,7 +55,6 @@ class PriceService:
                 continue
             if df is None or df.empty:
                 continue
-
             closes = [(idx.strftime("%Y-%m-%d"), float(row["Close"]))
                       for idx, row in df.iterrows()]
             splits = [(idx.strftime("%Y-%m-%d"), float(row["Stock Splits"]))
@@ -96,30 +70,26 @@ class PriceService:
 
     @staticmethod
     def _candidates(symbol: str, ccy: str) -> list[str]:
-        """代號 → yfinance ticker 候選清單。"""
         if ccy == "TWD":
-            return [f"{symbol}.TW", f"{symbol}.TWO"]   # 上市 → 上櫃
-        return [symbol]                                 # 美股原樣
+            return [f"{symbol}.TW", f"{symbol}.TWO"]
+        return [symbol]
 
     @staticmethod
-    def _apply_splits(closes: list[tuple[str, float]],
-                      splits: list[tuple[str, float]]) -> list[tuple[str, float]]:
-        """split-only 調整:某日價格 ÷(該日「之後」所有拆股倍數的乘積)。"""
+    def _apply_splits(closes, splits):
         if not splits:
             return closes
         out = []
         for d, c in closes:
             factor = 1.0
             for sd, ratio in splits:
-                if d < sd:          # 拆股發生在 d 之後 → d 的價格要除
+                if d < sd:
                     factor *= ratio
             out.append((d, c / factor))
         return out
 
 
 class FXService:
-    """歷史匯率(對基準幣別)。P1 全為 TWD,先以恆等為主;
-    結構已備好,P4 接美股時 USD/TWD 走 yfinance 'USDTWD=X' + fx_cache。"""
+    """歷史匯率(對基準幣別)。"""
 
     def __init__(self, db, base_ccy: str = "TWD"):
         self.db = db

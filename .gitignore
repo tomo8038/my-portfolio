@@ -4,3 +4,5 @@
 __pycache__/
 *.log
 node_modules/
+schwab_token.json
+backups/

@@ -84,22 +84,10 @@ realized = pd.read_sql(
 flows = {d: a for d, a in con.execute(
     "SELECT trade_date, SUM(amount) FROM transactions "
     "WHERE txn_type IN ('DEPOSIT','WITHDRAW') GROUP BY trade_date")}
-# [P4d] 各幣別 → TWD 最新匯率(美股市值/損益換算用);TWD 自身為 1
-fx_latest = {"TWD": 1.0}
-for pair, rate in con.execute(
-        "SELECT pair, rate FROM fx_cache f WHERE date = "
-        "(SELECT MAX(date) FROM fx_cache WHERE pair = f.pair)"):
-    if pair.endswith("TWD") and len(pair) >= 6:
-        fx_latest[pair[:-3]] = rate          # 'USDTWD' -> 'USD'
 con.close()
 
 if not pos.empty:
-    # market_value_native / unrealized_pnl_native 是「原幣」(美股為 USD)。
-    # 統一換算成 TWD,讓配置圖、持倉明細、損益排行的金額正確。
-    pos["fx"] = pos["ccy"].map(fx_latest).fillna(1.0)
-    pos["mv"] = pos["mv"] * pos["fx"]
-    pos["pnl"] = pos["pnl"] * pos["fx"]
-    pos["cost_value"] = pos["qty"] * pos["avg_cost"] * pos["fx"]
+    pos["cost_value"] = pos["qty"] * pos["avg_cost"]
     pos["ret_pct"] = (pos["pnl"] / pos["cost_value"] * 100).where(
         pos["cost_value"] != 0, 0.0)
     pos["industry"] = pos["industry"].fillna("").replace("", "其他")
@@ -141,8 +129,8 @@ else:
                 if r["symbol"] in lq:
                     px = lq[r["symbol"]][0]
                     hit += 1
-                l_inv += r["qty"] * px * r["fx"]
-                l_cost += r["qty"] * r["avg_cost"] * r["fx"]
+                l_inv += r["qty"] * px
+                l_cost += r["qty"] * r["avg_cost"]
             l_unrl = l_inv - l_cost
         l_nw = l_inv + cash
         l_pct = l_unrl / cost * 100 if cost else 0.0

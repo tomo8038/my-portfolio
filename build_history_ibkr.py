@@ -111,14 +111,22 @@ def positions(st: Replay) -> dict[str, Lot]:
 
 
 # ── 歷史價 ──────────────────────────────────────────────────────────────
-def fetch_prices(symbols: list[str], start: date, end: date) -> dict[str, dict[date, float]]:
-    """抓每日收盤;無網路 / 抓不到 → 回空 dict(交給成本遞補)。"""
+def fetch_prices(symbols: list[str], start: date, end: date):
+    """抓每日收盤 + yfinance 回報的「真實分割 ex-date」。
+
+    回傳 (prices, yf_splits):
+      prices    : {sym: {date: close_未調整}}
+      yf_splits : {sym: [(date, ratio), ...]}  yfinance 認定的分割生效日
+    無網路 / 沒裝 yfinance / 抓不到 → 回空(交給成本遞補、分割沿用注入日)。
+    """
     out: dict[str, dict[date, float]] = {}
+    yf_splits: dict[str, list] = {}
+    factor_splits: dict[str, list] = {}
     try:
         import yfinance as yf  # noqa
     except Exception:
         print("  [price] 未安裝 yfinance,跳過抓價(改以成本遞補)")
-        return out
+        return out, yf_splits, factor_splits
     for sym in symbols:
         psym = P.price_symbol(sym)
         if P.is_face_value(sym):
@@ -126,16 +134,77 @@ def fetch_prices(symbols: list[str], start: date, end: date) -> dict[str, dict[d
         try:
             df = yf.Ticker(psym).history(start=start.isoformat(),
                                          end=(end + timedelta(days=2)).isoformat(),
-                                         auto_adjust=False)
+                                         auto_adjust=False, actions=True)
             series = {d.date(): float(c) for d, c in df["Close"].items()}
             if series:
                 out[sym] = series
                 print(f"  [price] {sym} ({psym}): {len(series)} 日")
             else:
                 print(f"  [price] {sym}: 無資料,成本遞補")
+            if "Stock Splits" in df.columns:
+                raw_sp = [(idx.date(), float(v)) for idx, v in df["Stock Splits"].items()
+                          if float(v or 0) not in (0.0, 1.0)]
+                if raw_sp:
+                    closes_sorted = sorted(series.items())
+                    aligned, factored = [], []
+                    for action_d, ratio in raw_sp:
+                        drop_d = _detect_split_drop(closes_sorted, ratio, action_d)
+                        if drop_d:
+                            aligned.append((drop_d, ratio))
+                            print(f"  [split] {sym} 原始價下跌日 {drop_d} → 股數對齊掉價日")
+                        else:
+                            aligned.append((action_d, ratio))
+                            factored.append((action_d, ratio))
+                            print(f"  [split] {sym} 連續價(已調分割)→ 分割前股數 ×{ratio:g} 換算到分割後基準")
+                    yf_splits[sym] = aligned
+                    if factored:
+                        factor_splits[sym] = factored
         except Exception as ex:
             print(f"  [price] {sym}: 抓取失敗 ({ex}),成本遞補")
-    return out
+    return out, yf_splits, factor_splits
+
+
+def _detect_split_drop(closes_sorted, ratio: float, near: date,
+                       window: int = 7, tol: float = 0.15):
+    """從『未調整原始收盤』序列找出價格真的掉了 ratio 倍的那一天(=真正 ex-date)。
+
+    closes_sorted: [(date, price)] 升冪。near:yfinance 事件標記日(搜尋中心)。
+    正向分割當天收盤約為前一交易日的 1/ratio;比對到就回該日,否則回 None。
+    免疫「yfinance 事件日與原始價掉價日差一兩天」的情況。
+    """
+    best, best_gap = None, 10 ** 9
+    for i in range(1, len(closes_sorted)):
+        d, px = closes_sorted[i]
+        prev = closes_sorted[i - 1][1]
+        if px <= 0 or prev <= 0:
+            continue
+        if abs((prev / px) / ratio - 1.0) <= tol:
+            gap = abs((d - near).days)
+            if gap <= window and gap < best_gap:
+                best, best_gap = d, gap
+    return best
+
+
+def align_split_dates(events: list, yf_splits: dict) -> list:
+    """把注入的 split 事件挪到 yfinance 回報的真實 ex-date,
+    讓「股數加倍」與「價格減半」落在同一天 → 消除分割造成的單日假跳階。
+    無 yfinance 分割資料(離線)→ 保持原注入日期,不退步。"""
+    moved = 0
+    for e in events:
+        if e.kind != "split" or not e.symbol:
+            continue
+        cands = yf_splits.get(e.symbol) or []
+        if not cands:
+            continue
+        best = min(cands, key=lambda dr: abs((dr[0] - e.date).days))
+        if abs((best[0] - e.date).days) <= 7 and best[0] != e.date:
+            print(f"  [split] {e.symbol} 分割日對齊 yfinance:{e.date} → {best[0]}")
+            e.date = best[0]
+            moved += 1
+    if moved:
+        events.sort(key=lambda e: (e.date, 0 if e.kind == "split" else 1))
+        print(f"  [split] 已對齊 {moved} 筆分割日(避免分割日淨值假跳階)")
+    return events
 
 
 def price_on(prices: dict[date, float], day: date, fallback: float) -> float:
@@ -152,12 +221,24 @@ def price_on(prices: dict[date, float], day: date, fallback: float) -> float:
 
 
 # ── 每日淨值 ─────────────────────────────────────────────────────────────
-def daily_networth(events: list[P.Event], price_map, as_of: date | None = None) -> list[tuple]:
+def _split_factor(sym: str, day: date, factor_splits: dict) -> float:
+    """連續價情境:把分割前(day < 分割日)的股數換算到分割後基準(乘之後的分割比例)。"""
+    f = 1.0
+    for sdate, ratio in factor_splits.get(sym, []):
+        if sdate > day:
+            f *= ratio
+    return f
+
+
+def daily_networth(events: list[P.Event], price_map, as_of: date | None = None,
+                   factor_splits: dict | None = None) -> list[tuple]:
     """逐日:現金 + Σ(持股 × 當日收盤),USD 原幣。回傳 [(date, cash, holdings, networth)]。
 
     as_of:把曲線延伸到該日(預設今天)。最後一筆交易之後持股不變,
     每日仍以「當日收盤」重估市值 → 補齊 4/1 至今的每日帳戶變化。
+    factor_splits:連續價(已調分割)標的的分割表,估值時把分割前股數換算到分割後基準。
     """
+    factor_splits = factor_splits or {}
     day_events: dict[date, list[P.Event]] = defaultdict(list)
     for e in events:
         day_events[e.date].append(e)
@@ -181,7 +262,7 @@ def daily_networth(events: list[P.Event], price_map, as_of: date | None = None) 
             if abs(lot.qty) < 1e-9:
                 continue
             px = price_on(price_map.get(sym, {}), d, lot.avg)
-            holdings += lot.qty * px
+            holdings += lot.qty * px * _split_factor(sym, d, factor_splits)
         rows.append((d.isoformat(), cash, holdings, cash + holdings))
         d += timedelta(days=1)
     return rows
@@ -283,9 +364,10 @@ def main() -> None:
     start = min(e.date for e in events if e.kind != "split")
     last_event = max(e.date for e in events if e.kind != "split")
     end = max(last_event, as_of)
-    price_map = {} if no_prices else fetch_prices(syms, start, end)
+    price_map, yf_splits, factor_splits = ({}, {}, {}) if no_prices else fetch_prices(syms, start, end)
+    events = align_split_dates(events, yf_splits)   # 分割日對齊(問題2修正)
     print(f"計算每日淨值(延伸至 {as_of})…")
-    dn_rows = daily_networth(events, price_map, as_of=as_of)
+    dn_rows = daily_networth(events, price_map, as_of=as_of, factor_splits=factor_splits)
 
     print(f"寫入 {db_path} …")
     write_db(db_path, st, dn_rows, price_map)

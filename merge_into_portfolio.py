@@ -46,7 +46,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from parse_schwab_csv import parse_csv, is_cusip, yf_symbol
 from build_history import (replay, _holding_span, fetch_prices, price_on,
-                           daily_networth, asset_class, BROKER, ACCOUNT, ONE_DAY)
+                           daily_networth, asset_class, align_split_dates,
+                           BROKER, ACCOUNT, ONE_DAY)
 
 BASE_CCY = "TWD"
 USD = "USD"
@@ -120,7 +121,11 @@ def rate_on(rates: dict, d: str):
 
 def merge(csv_path: str, db_path: str, dry_run: bool = False):
     events = parse_csv(csv_path)
-    end_date = events[-1].date
+    last_event = events[-1].date
+    # 延伸到今天:最後一筆交易之後持股不變,逐日以當日收盤重估市值。
+    # (否則嘉信曲線只到最後交易日,6/13、6/14 會缺嘉信而驟降;且今天的快照
+    #  也因日期對不上而吃不到嘉信。)
+    end_date = max(last_event, date.today().isoformat())
     start_date = events[0].date
     print(f"[merge] 嘉信事件 {len(events)} 筆,{start_date} ~ {end_date}")
 
@@ -146,7 +151,10 @@ def merge(csv_path: str, db_path: str, dry_run: bool = False):
     spans = _holding_span(events)
     end_plus = (date.fromisoformat(end_date) + ONE_DAY).isoformat()
     print("[merge] 抓嘉信歷史股價(抓不到以成本遞補)...")
-    prices = fetch_prices(spans, end_plus)
+    prices, yf_splits, factor_splits = fetch_prices(spans, end_plus)
+    # 分割日對齊(問題2修正):股數加倍挪到 yfinance 真實 ex-date,
+    # 與價格減半同一天 → 嘉信併入 portfolio.db 的每日曲線不再出現假跳階。
+    events = align_split_dates(events, yf_splits)
     print("[merge] 抓 USD/TWD 歷史匯率...")
     rates = load_fx(con, start_date, end_plus)
     if not rates:
@@ -160,7 +168,7 @@ def merge(csv_path: str, db_path: str, dry_run: bool = False):
 
     # ---- 3) 嘉信每日 USD 淨值(原生)----
     print("[merge] 逐日重算嘉信 USD 淨值...")
-    schwab_series = daily_networth(events, prices, end_date)  # [(date, usd, is_real)]
+    schwab_series = daily_networth(events, prices, end_date, factor_splits)  # [(date, usd, is_real)]
     schwab_usd = {d: nv for d, nv, _ in schwab_series}
 
     if dry_run:

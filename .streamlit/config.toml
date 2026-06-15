@@ -1,11 +1,11 @@
-# 深色科技風主題 — 讓 Streamlit 外框/側邊欄/元件與儀表板一致
-# 放在專案根目錄的 .streamlit/config.toml(與 rebuild_all.py 同層的 .streamlit 資料夾)
+# 亮色暖奶油主題 — 讓 Streamlit 外框/側邊欄/元件與儀表板一致
+# 放在專案根目錄的 .streamlit/config.toml(與 rebuild_all.py 同層)
 [theme]
-base = "dark"
-primaryColor = "#29e0c4"
-backgroundColor = "#0a0e1a"
-secondaryBackgroundColor = "#141a28"
-textColor = "#e8eef9"
+base = "light"
+primaryColor = "#1f8a78"
+backgroundColor = "#f6f1e7"
+secondaryBackgroundColor = "#fffdf9"
+textColor = "#332e25"
 font = "sans serif"
 
 [server]

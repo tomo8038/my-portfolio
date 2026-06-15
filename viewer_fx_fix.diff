@@ -1,0 +1,154 @@
+diff --git a/viewer/app.py b/viewer/app.py
+index c650b39..0866ce1 100644
+--- a/viewer/app.py
++++ b/viewer/app.py
+@@ -173,9 +173,9 @@ if not DB_PATH.exists():
+     st.stop()
+ 
+ 
+-def q(con, sql, default=None):
++def q(con, sql, default=None, params=None):
+     try:
+-        return pd.read_sql(sql, con)
++        return pd.read_sql(sql, con, params=params)
+     except Exception:
+         return default if default is not None else pd.DataFrame()
+ 
+@@ -204,12 +204,29 @@ snaps_table = q(con, "SELECT substr(ts,1,16) AS 時間, net_worth AS 淨值, "
+ div_cache = q(con, "SELECT symbol, date, amount FROM dividend_cache")
+ realized = q(con, "SELECT symbol, qty, price, pnl, trade_date FROM realized_pnl "
+                   "ORDER BY trade_date")
++
++# 各幣別→TWD 的最新匯率(美股市值/損益以原幣 USD 儲存,需換成 TWD 才能與 KPI、
++# 以及彼此相加;否則把幾千 USD 當幾千 TWD 加總,配置/損益會嚴重失真)。
++fx_rate = {"TWD": 1.0}
++fx_missing: list[str] = []
++if not pos.empty:
++    for ccy in sorted(c for c in pos["ccy"].dropna().unique() if c != "TWD"):
++        r = q(con, "SELECT rate FROM fx_cache WHERE pair = ? "
++                   "ORDER BY date DESC LIMIT 1", params=(f"{ccy}TWD",))
++        if r is not None and not r.empty:
++            fx_rate[ccy] = float(r["rate"].iloc[0])
++        else:
++            fx_rate[ccy] = 1.0
++            fx_missing.append(ccy)
+ con.close()
+ 
+ if not pos.empty:
+-    pos["cost_value"] = pos["qty"] * pos["avg_cost"]
++    pos["fx"] = pos["ccy"].map(fx_rate).fillna(1.0)
++    pos["mv_twd"] = pos["mv"] * pos["fx"]                 # 市值(換算成 TWD)
++    pos["pnl_twd"] = pos["pnl"] * pos["fx"]               # 未實現損益(TWD)
++    pos["cost_value"] = pos["qty"] * pos["avg_cost"]      # 成本(原幣,算報酬率用)
+     pos["ret_pct"] = (pos["pnl"] / pos["cost_value"] * 100).where(
+-        pos["cost_value"] != 0, 0.0)
++        pos["cost_value"] != 0, 0.0)                      # 報酬率與幣別無關
+     pos["industry"] = pos["industry"].fillna("").replace("", "其他")
+ 
+ BROKER_NAMES = {"sinopac": "永豐金", "schwab": "嘉信", "ibkr": "盈透"}
+@@ -266,10 +283,11 @@ else:
+             lq = {}
+         lcon.close()
+         if lq and not pos.empty:
++            # 即時市值 = Σ 股數 × 即時(原幣)價 × 該幣別匯率 → TWD
+             l_inv = float((pos.apply(
+-                lambda r: r["qty"] * lq.get(r["symbol"], r["last_price"]),
+-                axis=1)).sum())
+-            l_cost = float(pos["cost_value"].sum())
++                lambda r: r["qty"] * lq.get(r["symbol"], r["last_price"])
++                * r["fx"], axis=1)).sum())
++            l_cost = float((pos["cost_value"] * pos["fx"]).sum())
+         else:
+             l_inv, l_cost = invested, cost
+         l_unrl = l_inv - l_cost
+@@ -340,16 +358,18 @@ with tab_ov:
+             st.info("目前沒有持倉。")
+         else:
+             show = pos[["broker", "symbol", "name", "asset_class", "qty",
+-                        "avg_cost", "last_price", "mv", "pnl", "ret_pct"]].copy()
++                        "avg_cost", "last_price", "mv_twd", "pnl_twd",
++                        "ret_pct"]].copy()
+             show["broker"] = show["broker"].map(lambda b: BROKER_NAMES.get(b, b))
+             show["asset_class"] = show["asset_class"].map(
+                 lambda c: CLASS_NAMES.get(c, c))
+             show.columns = ["券商", "代號", "名稱", "類別", "股數", "均價",
+-                            "現價", "市值", "未實現損益", "報酬率%"]
++                            "現價", "市值(TWD)", "未實現損益(TWD)", "報酬率%"]
+             st.dataframe(show.style.format({
+                 "股數": "{:,.0f}", "均價": "{:,.2f}", "現價": "{:,.2f}",
+-                "市值": "{:,.0f}", "未實現損益": "{:+,.0f}", "報酬率%": "{:+.1f}%",
+-            }).map(pnl_css, subset=["未實現損益", "報酬率%"]),
++                "市值(TWD)": "{:,.0f}", "未實現損益(TWD)": "{:+,.0f}",
++                "報酬率%": "{:+.1f}%",
++            }).map(pnl_css, subset=["未實現損益(TWD)", "報酬率%"]),
+                 width="stretch", hide_index=True)
+     with right:
+         st.markdown('<div class="sect">快照紀錄</div>', unsafe_allow_html=True)
+@@ -376,8 +396,8 @@ with tab_alloc:
+         if pos.empty:
+             agg = pd.DataFrame(columns=["key", "金額"])
+         else:
+-            agg = (pos.groupby(dim_col)["mv"].sum()
+-                   .reset_index().rename(columns={dim_col: "key", "mv": "金額"}))
++            agg = (pos.groupby(dim_col)["mv_twd"].sum()
++                   .reset_index().rename(columns={dim_col: "key", "mv_twd": "金額"}))
+             if dim == "券商":
+                 agg["key"] = agg["key"].map(lambda b: BROKER_NAMES.get(b, b))
+             if dim == "類別":
+@@ -409,9 +429,15 @@ with tab_alloc:
+             tbl.columns = [dim, "金額", "占比%"]
+             st.dataframe(tbl.style.format({"金額": "NT$ {:,.0f}", "占比%": "{:.1f}%"}),
+                          width="stretch", hide_index=True)
+-            if dim in ("券商", "幣別"):
+-                st.markdown('<div class="caption">註:跨幣別市值以各標的原幣計,'
+-                            '完整 TWD 換算以淨值快照為準。</div>',
++            usd = fx_rate.get("USD")
++            if usd and usd != 1.0:
++                st.markdown(f'<div class="caption">美股市值已用最新 USD/TWD '
++                            f'≈ {usd:,.2f} 換算為 TWD,與上方 KPI 一致。</div>',
++                            unsafe_allow_html=True)
++            if fx_missing:
++                st.markdown('<div class="caption" style="color:#ffb454">⚠ '
++                            f'缺 {"/".join(fx_missing)} 對 TWD 匯率(fx_cache 無資料),'
++                            '該幣別暫以原幣計入。請確認 rebuild_all.py 的匯率回補。</div>',
+                             unsafe_allow_html=True)
+ 
+ # ======================================================================
+@@ -422,8 +448,8 @@ with tab_pnl:
+         st.info("目前沒有持倉。")
+     else:
+         mode = st.radio("排序依據", ["金額 (NT$)", "報酬率 (%)"], horizontal=True)
+-        col = "pnl" if mode.startswith("金額") else "ret_pct"
+-        rank = pos[["symbol", "name", "broker", "pnl", "ret_pct"]].copy()
++        col = "pnl_twd" if mode.startswith("金額") else "ret_pct"
++        rank = pos[["symbol", "name", "broker", "pnl_twd", "ret_pct"]].copy()
+         rank["標的"] = rank["symbol"] + " " + rank["name"].fillna("")
+         rank = rank.sort_values(col, ascending=False)
+ 
+@@ -431,22 +457,22 @@ with tab_pnl:
+         cards = "".join([
+             kpi_card("獲利檔數", f"{len(win)} 檔",
+                      f'<div class="delta" style="color:{UP}">'
+-                     f'+NT$ {win["pnl"].sum():,.0f}</div>'),
++                     f'+NT$ {win["pnl_twd"].sum():,.0f}</div>'),
+             kpi_card("虧損檔數", f"{len(los)} 檔",
+                      f'<div class="delta" style="color:{DOWN}">'
+-                     f'-NT$ {abs(los["pnl"].sum()):,.0f}</div>'),
++                     f'-NT$ {abs(los["pnl_twd"].sum()):,.0f}</div>'),
+         ])
+         st.markdown(f'<div class="kpis" style="grid-template-columns:repeat(2,1fr);'
+                     f'max-width:520px">{cards}</div>', unsafe_allow_html=True)
+         st.write("")
+         bars = alt.Chart(rank).mark_bar(cornerRadius=4, height=18).encode(
+             x=alt.X(f"{col}:Q",
+-                    title="未實現損益 (NT$)" if col == "pnl" else "報酬率 (%)"),
++                    title="未實現損益 (NT$)" if col == "pnl_twd" else "報酬率 (%)"),
+             y=alt.Y("標的:N", sort="-x", title=None),
+             color=alt.condition(alt.datum[col] >= 0,
+                                 alt.value(UP), alt.value(DOWN)),
+             tooltip=[alt.Tooltip("標的:N"),
+-                     alt.Tooltip("pnl:Q", title="損益", format="+,.0f"),
++                     alt.Tooltip("pnl_twd:Q", title="損益(TWD)", format="+,.0f"),
+                      alt.Tooltip("ret_pct:Q", title="報酬率%", format="+.1f")],
+         ).properties(height=max(220, 40 * len(rank)))
+         st.altair_chart(chart_theme(bars), width="stretch")

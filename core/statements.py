@@ -124,26 +124,40 @@ def _iso(d: str, fmts: tuple[str, ...]) -> str:
 def parse_sinopac(path) -> Statement:
     rows = _read_tolerant(path)
     out: list[Event] = []
+    has_deposit = False
     for i, r in enumerate(rows[1:], 1):
         if len(r) < 10 or not r[0].strip():
             continue
         date = _iso(r[0], ("%Y/%m/%d", "%Y-%m-%d"))
         product = r[1].strip()
         sym = product.split()[0] if product else ""
-        side = r[2].strip()                      # 現買 / 現賣
+        side = r[2].strip()                      # 現買 / 現賣 / 入金 / 配息
         qty = _num(r[3])
         price = _num(r[4])
+        gross = _num(r[5])                       # 價金(入金:即入金金額)
         payable = _num(r[8])                     # 應付金額(買:含手續費)
-        receivable = _num(r[9])                  # 應收金額(賣:扣費稅後)
+        receivable = _num(r[9])                  # 應收金額(賣/配息:扣費稅後)
         order_no = (r[14].strip() if len(r) > 14 else "") or f"row{i}"
         ext = f"sinopac-{date}-{order_no}-{i}"
-        if "買" in side:
+        if "入金" in side:
+            # 入金:純現金流入(無標的、無股數);價金欄即入金金額
+            out.append(Event(date, "DEPOSIT", "", Decimal(0), Decimal(0),
+                             gross, side, ext))
+            has_deposit = True
+        elif "配息" in side:
+            # 配息:應收金額為實收現金(已扣手續費);掛在該標的下
+            amt = receivable if receivable else gross
+            out.append(Event(date, "DIVIDEND", sym, Decimal(0), Decimal(0),
+                             amt, side, ext))
+        elif "買" in side:
             out.append(Event(date, "BUY", sym, qty, price, -payable,
                              side, ext))
         elif "賣" in side:
             out.append(Event(date, "SELL", sym, qty, price, receivable,
                              side, ext))
-    return Statement("sinopac", "TWD", out, cash_is_real=False)
+    # 對帳單一旦含「入金」,回放推得的現金即為真實帳戶現金 → 可採計、寫入 broker_cash。
+    # 純成交流水(無入金)時維持 False:那時的「現金」只是買賣淨額,並非帳戶餘額。
+    return Statement("sinopac", "TWD", out, cash_is_real=has_deposit)
 
 
 # ====================================================================

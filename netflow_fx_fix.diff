@@ -1,0 +1,310 @@
+diff --git a/viewer/app.py b/viewer/app.py
+index c650b39..4674b67 100644
+--- a/viewer/app.py
++++ b/viewer/app.py
+@@ -20,6 +20,12 @@ import streamlit as st
+ sys.path.insert(0, str(Path(__file__).parent.parent))
+ DB_PATH = Path(__file__).parent.parent / "portfolio.db"
+ 
++try:
++    from core.performance import (compute_annual_performance,
++                                  compute_performance)
++except Exception:                       # 萬一 import 失敗,年度分頁降級提示
++    compute_annual_performance = compute_performance = None
++
+ st.set_page_config(page_title="資產整合儀表板", page_icon="◆",
+                    layout="wide", initial_sidebar_state="collapsed")
+ 
+@@ -173,9 +179,9 @@ if not DB_PATH.exists():
+     st.stop()
+ 
+ 
+-def q(con, sql, default=None):
++def q(con, sql, default=None, params=None):
+     try:
+-        return pd.read_sql(sql, con)
++        return pd.read_sql(sql, con, params=params)
+     except Exception:
+         return default if default is not None else pd.DataFrame()
+ 
+@@ -204,12 +210,65 @@ snaps_table = q(con, "SELECT substr(ts,1,16) AS 時間, net_worth AS 淨值, "
+ div_cache = q(con, "SELECT symbol, date, amount FROM dividend_cache")
+ realized = q(con, "SELECT symbol, qty, price, pnl, trade_date FROM realized_pnl "
+                   "ORDER BY trade_date")
++# 外部現金流(出入金)— 年度報酬 / TWR 用;入金正、出金負。amount 為各券商原幣,
++# 需逐筆用「當天匯率」換成 TWD(與每日淨值曲線同口徑),不能直接跨幣別相加。
++flows_df = q(con, "SELECT trade_date AS d, ccy, SUM(amount) AS a FROM transactions "
++                  "WHERE txn_type IN ('DEPOSIT','WITHDRAW') GROUP BY trade_date, ccy")
++# 完整 USD/TWD 歷史(供逐日換算),由舊到新
++usdtwd_df = q(con, "SELECT date, rate FROM fx_cache WHERE pair='USDTWD' "
++                   "ORDER BY date")
++
++# 各幣別→TWD 的最新匯率(美股市值/損益以原幣 USD 儲存,需換成 TWD 才能與 KPI、
++# 以及彼此相加;否則把幾千 USD 當幾千 TWD 加總,配置/損益會嚴重失真)。
++fx_rate = {"TWD": 1.0}
++fx_missing: list[str] = []
++if not pos.empty:
++    for ccy in sorted(c for c in pos["ccy"].dropna().unique() if c != "TWD"):
++        r = q(con, "SELECT rate FROM fx_cache WHERE pair = ? "
++                   "ORDER BY date DESC LIMIT 1", params=(f"{ccy}TWD",))
++        if r is not None and not r.empty:
++            fx_rate[ccy] = float(r["rate"].iloc[0])
++        else:
++            fx_rate[ccy] = 1.0
++            fx_missing.append(ccy)
+ con.close()
+ 
++# 逐日 USD/TWD 查詢(forward-fill;早於最早一筆則用最早一筆)
++_fx_dates = list(usdtwd_df["date"]) if not usdtwd_df.empty else []
++_fx_vals = list(usdtwd_df["rate"]) if not usdtwd_df.empty else []
++
++
++def usdtwd_on(d: str):
++    if not _fx_dates:
++        return None
++    import bisect
++    i = bisect.bisect_right(_fx_dates, d)
++    return _fx_vals[i - 1] if i > 0 else _fx_vals[0]
++
++
++# 把出入金換成 TWD,彙總成 {date: 淨流入(TWD)}
++flows_twd: dict[str, float] = {}
++flow_fx_missing = False
++if not flows_df.empty:
++    for _, fr in flows_df.iterrows():
++        d, ccy, a = str(fr["d"]), (fr["ccy"] or "TWD"), float(fr["a"])
++        if ccy == "TWD":
++            amt = a
++        else:                       # 非台幣(本系統即 USD)→ 當天 USD/TWD 換算
++            rate = usdtwd_on(d)
++            if rate is None:
++                rate = 1.0
++                flow_fx_missing = True
++            amt = a * rate
++        flows_twd[d] = flows_twd.get(d, 0.0) + amt
++
+ if not pos.empty:
+-    pos["cost_value"] = pos["qty"] * pos["avg_cost"]
++    pos["fx"] = pos["ccy"].map(fx_rate).fillna(1.0)
++    pos["mv_twd"] = pos["mv"] * pos["fx"]                 # 市值(換算成 TWD)
++    pos["pnl_twd"] = pos["pnl"] * pos["fx"]               # 未實現損益(TWD)
++    pos["cost_value"] = pos["qty"] * pos["avg_cost"]      # 成本(原幣,算報酬率用)
+     pos["ret_pct"] = (pos["pnl"] / pos["cost_value"] * 100).where(
+-        pos["cost_value"] != 0, 0.0)
++        pos["cost_value"] != 0, 0.0)                      # 報酬率與幣別無關
+     pos["industry"] = pos["industry"].fillna("").replace("", "其他")
+ 
+ BROKER_NAMES = {"sinopac": "永豐金", "schwab": "嘉信", "ibkr": "盈透"}
+@@ -266,10 +325,11 @@ else:
+             lq = {}
+         lcon.close()
+         if lq and not pos.empty:
++            # 即時市值 = Σ 股數 × 即時(原幣)價 × 該幣別匯率 → TWD
+             l_inv = float((pos.apply(
+-                lambda r: r["qty"] * lq.get(r["symbol"], r["last_price"]),
+-                axis=1)).sum())
+-            l_cost = float(pos["cost_value"].sum())
++                lambda r: r["qty"] * lq.get(r["symbol"], r["last_price"])
++                * r["fx"], axis=1)).sum())
++            l_cost = float((pos["cost_value"] * pos["fx"]).sum())
+         else:
+             l_inv, l_cost = invested, cost
+         l_unrl = l_inv - l_cost
+@@ -294,8 +354,9 @@ else:
+     _live_kpis()
+ 
+ st.write("")
+-tab_ov, tab_alloc, tab_pnl, tab_div, tab_real = st.tabs(
+-    ["　總覽　", "　資產配置　", "　損益排行　", "　股息現金流　", "　已實現損益　"])
++tab_ov, tab_alloc, tab_pnl, tab_year, tab_div, tab_real = st.tabs(
++    ["　總覽　", "　資產配置　", "　損益排行　", "　年度報酬　",
++     "　股息現金流　", "　已實現損益　"])
+ 
+ # ======================================================================
+ # 分頁 1:總覽
+@@ -340,16 +401,18 @@ with tab_ov:
+             st.info("目前沒有持倉。")
+         else:
+             show = pos[["broker", "symbol", "name", "asset_class", "qty",
+-                        "avg_cost", "last_price", "mv", "pnl", "ret_pct"]].copy()
++                        "avg_cost", "last_price", "mv_twd", "pnl_twd",
++                        "ret_pct"]].copy()
+             show["broker"] = show["broker"].map(lambda b: BROKER_NAMES.get(b, b))
+             show["asset_class"] = show["asset_class"].map(
+                 lambda c: CLASS_NAMES.get(c, c))
+             show.columns = ["券商", "代號", "名稱", "類別", "股數", "均價",
+-                            "現價", "市值", "未實現損益", "報酬率%"]
++                            "現價", "市值(TWD)", "未實現損益(TWD)", "報酬率%"]
+             st.dataframe(show.style.format({
+                 "股數": "{:,.0f}", "均價": "{:,.2f}", "現價": "{:,.2f}",
+-                "市值": "{:,.0f}", "未實現損益": "{:+,.0f}", "報酬率%": "{:+.1f}%",
+-            }).map(pnl_css, subset=["未實現損益", "報酬率%"]),
++                "市值(TWD)": "{:,.0f}", "未實現損益(TWD)": "{:+,.0f}",
++                "報酬率%": "{:+.1f}%",
++            }).map(pnl_css, subset=["未實現損益(TWD)", "報酬率%"]),
+                 width="stretch", hide_index=True)
+     with right:
+         st.markdown('<div class="sect">快照紀錄</div>', unsafe_allow_html=True)
+@@ -376,8 +439,8 @@ with tab_alloc:
+         if pos.empty:
+             agg = pd.DataFrame(columns=["key", "金額"])
+         else:
+-            agg = (pos.groupby(dim_col)["mv"].sum()
+-                   .reset_index().rename(columns={dim_col: "key", "mv": "金額"}))
++            agg = (pos.groupby(dim_col)["mv_twd"].sum()
++                   .reset_index().rename(columns={dim_col: "key", "mv_twd": "金額"}))
+             if dim == "券商":
+                 agg["key"] = agg["key"].map(lambda b: BROKER_NAMES.get(b, b))
+             if dim == "類別":
+@@ -409,9 +472,15 @@ with tab_alloc:
+             tbl.columns = [dim, "金額", "占比%"]
+             st.dataframe(tbl.style.format({"金額": "NT$ {:,.0f}", "占比%": "{:.1f}%"}),
+                          width="stretch", hide_index=True)
+-            if dim in ("券商", "幣別"):
+-                st.markdown('<div class="caption">註:跨幣別市值以各標的原幣計,'
+-                            '完整 TWD 換算以淨值快照為準。</div>',
++            usd = fx_rate.get("USD")
++            if usd and usd != 1.0:
++                st.markdown(f'<div class="caption">美股市值已用最新 USD/TWD '
++                            f'≈ {usd:,.2f} 換算為 TWD,與上方 KPI 一致。</div>',
++                            unsafe_allow_html=True)
++            if fx_missing:
++                st.markdown('<div class="caption" style="color:#ffb454">⚠ '
++                            f'缺 {"/".join(fx_missing)} 對 TWD 匯率(fx_cache 無資料),'
++                            '該幣別暫以原幣計入。請確認 rebuild_all.py 的匯率回補。</div>',
+                             unsafe_allow_html=True)
+ 
+ # ======================================================================
+@@ -422,8 +491,8 @@ with tab_pnl:
+         st.info("目前沒有持倉。")
+     else:
+         mode = st.radio("排序依據", ["金額 (NT$)", "報酬率 (%)"], horizontal=True)
+-        col = "pnl" if mode.startswith("金額") else "ret_pct"
+-        rank = pos[["symbol", "name", "broker", "pnl", "ret_pct"]].copy()
++        col = "pnl_twd" if mode.startswith("金額") else "ret_pct"
++        rank = pos[["symbol", "name", "broker", "pnl_twd", "ret_pct"]].copy()
+         rank["標的"] = rank["symbol"] + " " + rank["name"].fillna("")
+         rank = rank.sort_values(col, ascending=False)
+ 
+@@ -431,26 +500,117 @@ with tab_pnl:
+         cards = "".join([
+             kpi_card("獲利檔數", f"{len(win)} 檔",
+                      f'<div class="delta" style="color:{UP}">'
+-                     f'+NT$ {win["pnl"].sum():,.0f}</div>'),
++                     f'+NT$ {win["pnl_twd"].sum():,.0f}</div>'),
+             kpi_card("虧損檔數", f"{len(los)} 檔",
+                      f'<div class="delta" style="color:{DOWN}">'
+-                     f'-NT$ {abs(los["pnl"].sum()):,.0f}</div>'),
++                     f'-NT$ {abs(los["pnl_twd"].sum()):,.0f}</div>'),
+         ])
+         st.markdown(f'<div class="kpis" style="grid-template-columns:repeat(2,1fr);'
+                     f'max-width:520px">{cards}</div>', unsafe_allow_html=True)
+         st.write("")
+         bars = alt.Chart(rank).mark_bar(cornerRadius=4, height=18).encode(
+             x=alt.X(f"{col}:Q",
+-                    title="未實現損益 (NT$)" if col == "pnl" else "報酬率 (%)"),
++                    title="未實現損益 (NT$)" if col == "pnl_twd" else "報酬率 (%)"),
+             y=alt.Y("標的:N", sort="-x", title=None),
+             color=alt.condition(alt.datum[col] >= 0,
+                                 alt.value(UP), alt.value(DOWN)),
+             tooltip=[alt.Tooltip("標的:N"),
+-                     alt.Tooltip("pnl:Q", title="損益", format="+,.0f"),
++                     alt.Tooltip("pnl_twd:Q", title="損益(TWD)", format="+,.0f"),
+                      alt.Tooltip("ret_pct:Q", title="報酬率%", format="+.1f")],
+         ).properties(height=max(220, 40 * len(rank)))
+         st.altair_chart(chart_theme(bars), width="stretch")
+ 
++# ======================================================================
++# 分頁:年度報酬(TWR 口徑,出入金不計入績效)
++# ======================================================================
++with tab_year:
++    s = series.copy()
++    flows = flows_twd
++    if compute_annual_performance is None:
++        st.info("年度報酬引擎載入失敗(core/performance.py)。請確認檔案存在。")
++    elif s.empty or len(s) < 2:
++        st.info("每日淨值資料不足,無法計算年度報酬。先跑 `python rebuild_all.py`。")
++    else:
++        ser = list(zip(s["date"].astype(str), s["net_worth"].astype(float)))
++        rows = compute_annual_performance(ser, flows)
++        full = compute_performance(ser, flows)
++
++        # 全期摘要 KPI
++        tot_pnl = sum(r["pnl"] for r in rows)
++        full_twr = full["twr"] if full else None
++        full_ann = full["twr_annualized"] if full else None
++        tc = UP if tot_pnl >= 0 else DOWN
++        twr_c = UP if (full_twr or 0) >= 0 else DOWN
++        cards = "".join([
++            kpi_card("累計投資損益", f"NT$ {tot_pnl:+,.0f}",
++                     '<div class="delta" style="color:#7e8aa3">'
++                     '已扣除出入金</div>'),
++            kpi_card("全期 TWR", f"{full_twr*100:+.2f}%" if full_twr is not None
++                     else "—",
++                     f'<div class="delta" style="color:{twr_c}">時間加權報酬</div>'),
++            kpi_card("全期年化", f"{full_ann*100:+.2f}%" if full_ann is not None
++                     else "—",
++                     f'<div class="delta" style="color:#7e8aa3">'
++                     f'{full["days"]} 天</div>' if full else ""),
++        ])
++        st.markdown(f'<div class="kpis" style="grid-template-columns:'
++                    f'repeat(3,1fr)">{cards}</div>', unsafe_allow_html=True)
++        st.write("")
++
++        # 年度 TWR 長條圖
++        st.markdown('<div class="sect">各年度報酬率(TWR)</div>',
++                    unsafe_allow_html=True)
++        bar_df = pd.DataFrame([{
++            "年度": str(r["year"]),
++            "報酬率": (r["twr"] * 100) if r["twr"] is not None else 0.0,
++            "未滿年": "未滿整年" if r["partial"] else "整年",
++        } for r in rows])
++        ybars = alt.Chart(bar_df).mark_bar(cornerRadius=5).encode(
++            x=alt.X("年度:N", sort=None, title=None),
++            y=alt.Y("報酬率:Q", title="TWR (%)"),
++            color=alt.condition(alt.datum["報酬率"] >= 0,
++                                alt.value(UP), alt.value(DOWN)),
++            opacity=alt.condition(alt.datum["未滿年"] == "整年",
++                                  alt.value(1.0), alt.value(0.55)),
++            tooltip=[alt.Tooltip("年度:N"),
++                     alt.Tooltip("報酬率:Q", format="+.2f"),
++                     alt.Tooltip("未滿年:N")],
++        ).properties(height=240)
++        st.altair_chart(chart_theme(ybars), width="stretch")
++        st.markdown('<div class="caption">半透明長條代表未滿整年(首年自開戶日、'
++                    '當年至今);其報酬率為該區間實際值,年化欄為外推年化值。</div>',
++                    unsafe_allow_html=True)
++        st.write("")
++
++        # 年度明細表
++        st.markdown('<div class="sect">年度明細</div>', unsafe_allow_html=True)
++        tbl = pd.DataFrame([{
++            "年度": f'{r["year"]}{"*" if r["partial"] else ""}',
++            "起始金額": r["start_nv"],
++            "最終金額": r["end_nv"],
++            "淨流入": r["net_flow"],
++            "損益": r["pnl"],
++            "報酬率(TWR)": r["twr"] * 100 if r["twr"] is not None else None,
++            "年化報酬": r["annualized"] * 100 if r["annualized"] is not None
++            else None,
++        } for r in reversed(rows)])
++        st.dataframe(tbl.style.format({
++            "起始金額": "NT$ {:,.0f}", "最終金額": "NT$ {:,.0f}",
++            "淨流入": "{:+,.0f}", "損益": "{:+,.0f}",
++            "報酬率(TWR)": "{:+.2f}%", "年化報酬": "{:+.2f}%",
++        }, na_rep="—").map(pnl_css, subset=["損益", "報酬率(TWR)", "年化報酬"]),
++            width="stretch", hide_index=True)
++        st.markdown('<div class="caption">起始金額＝進入該年度時的淨值(前一年末);'
++                    '損益＝期末−期初−淨流入(扣掉出入金的真實投資損益);'
++                    '淨流入為各券商出入金以「當天匯率」換算後的 TWD 合計;'
++                    '報酬率為 TWR(出入金不影響);* 表示未滿整年。</div>',
++                    unsafe_allow_html=True)
++        if flow_fx_missing:
++            st.markdown('<div class="caption" style="color:#ffb454">⚠ '
++                        '部分出入金日期早於匯率資料範圍,該筆暫以原幣計入。'
++                        '請確認 rebuild_all.py 的 USD/TWD 匯率回補涵蓋最早交易日。'
++                        '</div>', unsafe_allow_html=True)
++
+ # ======================================================================
+ # 分頁 4:股息現金流(估算)
+ # ======================================================================

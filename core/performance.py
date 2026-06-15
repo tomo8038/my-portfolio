@@ -69,3 +69,64 @@ def compute_performance(series: list[tuple[str, float]],
 
 def _d(s: str):
     return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def compute_annual_performance(series: list[tuple[str, float]],
+                               flows: dict[str, float]) -> list[dict]:
+    """逐年度績效(由舊到新)。每筆:
+        {year, start_date, end_date, start_nv, end_nv, net_flow, pnl,
+         twr, annualized, days, partial}
+
+    口徑說明
+    --------
+    * 起始金額 start_nv:進入該年度時的淨值 = 前一年最後一交易日淨值
+      (首年無前值 → 取序列首日)。如此年與年首尾相接、不漏不重。
+    * 淨流入 net_flow:該年度區間 (start_date, end_date] 的淨外部現金流
+      (入金正、出金負)。
+    * 損益 pnl = 期末 − 期初 − 淨流入:扣掉出入金後的「真實投資損益」。
+      (若只看 期末−期初,入金會被誤算成獲利。)
+    * 報酬率 twr:該年度的時間加權報酬,出入金不影響(基金淨值法)。
+    * 年化 annualized:依該區間實際天數年化;整年≈twr,首年/當年(未滿一年)
+      會外推為年化值。partial=True 標示「未滿整年」。
+    """
+    if not series:
+        return []
+    series = sorted(series)
+    from collections import defaultdict
+    by_year: dict[str, list] = defaultdict(list)
+    for d, nv in series:
+        by_year[d[:4]].append((d, nv))
+
+    out: list[dict] = []
+    prev_end: tuple[str, float] | None = None
+    for y in sorted(by_year):
+        ys = by_year[y]
+        if prev_end is not None:
+            sub = [prev_end] + ys
+            start_d, start_nv = prev_end
+        else:
+            sub = ys
+            start_d, start_nv = ys[0]
+        end_d, end_nv = ys[-1]
+
+        net_flow = sum(a for d, a in flows.items() if start_d < d <= end_d)
+        pnl = end_nv - start_nv - net_flow
+        days = (_d(end_d) - _d(start_d)).days or 1
+
+        perf = compute_performance(sub, flows) if len(sub) >= 2 and start_nv > 0 \
+            else None
+        twr = perf["twr"] if perf else None
+        ann = ((1 + twr) ** (365.0 / days) - 1.0) \
+            if (twr is not None and (1 + twr) > 0) else None
+
+        # 未滿整年:首年起點晚於 1/1,或當年尚未走到年底
+        partial = not (start_d <= f"{y}-01-01" and end_d >= f"{y}-12-28")
+
+        out.append({
+            "year": int(y), "start_date": start_d, "end_date": end_d,
+            "start_nv": start_nv, "end_nv": end_nv, "net_flow": net_flow,
+            "pnl": pnl, "twr": twr, "annualized": ann, "days": days,
+            "partial": partial,
+        })
+        prev_end = (end_d, end_nv)
+    return out

@@ -63,6 +63,11 @@ def main() -> None:
     ap.add_argument("--schwab-csv", default=None, help="嘉信 CSV(預設自動找 schwab*.csv)")
     ap.add_argument("--ibkr-csv", default=None, help="盈透 CSV(預設自動找 *TRANSACTIONS*.csv)")
     ap.add_argument("--keep", action="store_true", help="不刪既有 portfolio.db/ibkr.db")
+    ap.add_argument("--sinopac-csv", default=None,
+                    help="永豐 CSV(預設自動找 sinopac*.csv);提供時台股改走 CSV 匯入,"
+                         "會解析現買/現賣/入金/配息")
+    ap.add_argument("--taiwan-live", action="store_true",
+                    help="強制台股走 run.py(永豐即時 API),即使找到 sinopac CSV")
     ap.add_argument("--mock-taiwan", action="store_true", help="台股用 run.py --mock(假資料,免憑證)")
     ap.add_argument("--skip-taiwan", action="store_true", help="完全跳過台股,只建美股")
     args = ap.parse_args()
@@ -70,6 +75,19 @@ def main() -> None:
     db = args.db
     schwab = find_csv(["schwab*.csv", "*Schwab*.csv", "*嘉信*.csv"], args.schwab_csv)
     ibkr = find_csv(["*TRANSACTIONS*.csv", "U*_*.csv", "*ibkr*.csv", "*盈透*.csv"], args.ibkr_csv)
+    sinopac = find_csv(["sinopac*.csv", "*永豐*.csv"], args.sinopac_csv)
+    # 台股來源:有 sinopac CSV 且未強制 live/skip/mock → 走 CSV(含入金/配息);否則沿用 run.py
+    taiwan_via_csv = bool(sinopac) and not args.taiwan_live \
+        and not args.skip_taiwan and not args.mock_taiwan
+
+    if taiwan_via_csv:
+        tw_mode = f"CSV 匯入({sinopac})"
+    elif args.skip_taiwan:
+        tw_mode = "跳過"
+    elif args.mock_taiwan:
+        tw_mode = "假資料"
+    else:
+        tw_mode = "run.py(永豐憑證)"
 
     print("=" * 64)
     print("  從零重建 portfolio.db(台股 + 嘉信 + 盈透)")
@@ -77,7 +95,7 @@ def main() -> None:
     print(f"  目標 DB   : {db}")
     print(f"  嘉信 CSV  : {schwab or '(找不到)'}")
     print(f"  盈透 CSV  : {ibkr or '(找不到)'}")
-    print(f"  台股模式  : {'跳過' if args.skip_taiwan else ('假資料' if args.mock_taiwan else 'run.py(永豐憑證)')}")
+    print(f"  台股模式  : {tw_mode}")
 
     if not schwab:
         print("\n✗ 找不到嘉信 CSV。請用 --schwab-csv 指定檔名。")
@@ -91,8 +109,14 @@ def main() -> None:
                 p.unlink()
                 print(f"  已刪除舊檔:{f}")
 
-    # 1) 建庫 + 台股 + 匯率(run.py 會建立含 fx_cache 的完整表結構)
-    if args.skip_taiwan:
+    # 1) 建庫 + 台股 + 匯率(此步同時建立含 fx_cache 的完整表結構)
+    if taiwan_via_csv:
+        # 台股走 CSV:import_statements.py 會解析現買/現賣/入金/配息,
+        # 回放持倉、寫 transactions、並在偵測到入金時把重建現金寫進 broker_cash。
+        run_step([PY, "import_statements.py", sinopac, "--db", db],
+                 f"匯入台股對帳單(永豐 CSV:{sinopac})", essential=False)
+        ensure_db_schema(db)   # 確保 fx_cache 等表齊全(import 已建庫,這步為保險)
+    elif args.skip_taiwan:
         ensure_db_schema(db)
         print("  已跳過台股,僅建立空庫 + 表結構。")
     else:
@@ -100,7 +124,8 @@ def main() -> None:
         ok = run_step(cmd, "建立資料庫 + 台股 + 匯率(run.py)", essential=False)
         if not ok:
             print("  台股步驟未成功 → 改為只建空庫表結構,繼續做美股(US-only)。")
-            print("  若要含台股:確認 .env 永豐憑證後重跑,或加 --mock-taiwan。")
+            print("  若要含台股:確認 .env 永豐憑證後重跑,或加 --mock-taiwan,"
+                  "或放一份 sinopac.csv 走 CSV 匯入。")
             ensure_db_schema(db)
 
     # 2) 嘉信(merge 會自行抓六年 USD/TWD 匯率)

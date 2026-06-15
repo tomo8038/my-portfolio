@@ -1,0 +1,121 @@
+diff --git a/core/statements.py b/core/statements.py
+index 479dd48..3c939fe 100644
+--- a/core/statements.py
++++ b/core/statements.py
+@@ -124,26 +124,40 @@ def _iso(d: str, fmts: tuple[str, ...]) -> str:
+ def parse_sinopac(path) -> Statement:
+     rows = _read_tolerant(path)
+     out: list[Event] = []
++    has_deposit = False
+     for i, r in enumerate(rows[1:], 1):
+         if len(r) < 10 or not r[0].strip():
+             continue
+         date = _iso(r[0], ("%Y/%m/%d", "%Y-%m-%d"))
+         product = r[1].strip()
+         sym = product.split()[0] if product else ""
+-        side = r[2].strip()                      # 現買 / 現賣
++        side = r[2].strip()                      # 現買 / 現賣 / 入金 / 配息
+         qty = _num(r[3])
+         price = _num(r[4])
++        gross = _num(r[5])                       # 價金(入金:即入金金額)
+         payable = _num(r[8])                     # 應付金額(買:含手續費)
+-        receivable = _num(r[9])                  # 應收金額(賣:扣費稅後)
++        receivable = _num(r[9])                  # 應收金額(賣/配息:扣費稅後)
+         order_no = (r[14].strip() if len(r) > 14 else "") or f"row{i}"
+         ext = f"sinopac-{date}-{order_no}-{i}"
+-        if "買" in side:
++        if "入金" in side:
++            # 入金:純現金流入(無標的、無股數);價金欄即入金金額
++            out.append(Event(date, "DEPOSIT", "", Decimal(0), Decimal(0),
++                             gross, side, ext))
++            has_deposit = True
++        elif "配息" in side:
++            # 配息:應收金額為實收現金(已扣手續費);掛在該標的下
++            amt = receivable if receivable else gross
++            out.append(Event(date, "DIVIDEND", sym, Decimal(0), Decimal(0),
++                             amt, side, ext))
++        elif "買" in side:
+             out.append(Event(date, "BUY", sym, qty, price, -payable,
+                              side, ext))
+         elif "賣" in side:
+             out.append(Event(date, "SELL", sym, qty, price, receivable,
+                              side, ext))
+-    return Statement("sinopac", "TWD", out, cash_is_real=False)
++    # 對帳單一旦含「入金」,回放推得的現金即為真實帳戶現金 → 可採計、寫入 broker_cash。
++    # 純成交流水(無入金)時維持 False:那時的「現金」只是買賣淨額,並非帳戶餘額。
++    return Statement("sinopac", "TWD", out, cash_is_real=has_deposit)
+ 
+ 
+ # ====================================================================
+diff --git a/rebuild_all.py b/rebuild_all.py
+index 8e6d967..b5131a2 100644
+--- a/rebuild_all.py
++++ b/rebuild_all.py
+@@ -63,6 +63,11 @@ def main() -> None:
+     ap.add_argument("--schwab-csv", default=None, help="嘉信 CSV(預設自動找 schwab*.csv)")
+     ap.add_argument("--ibkr-csv", default=None, help="盈透 CSV(預設自動找 *TRANSACTIONS*.csv)")
+     ap.add_argument("--keep", action="store_true", help="不刪既有 portfolio.db/ibkr.db")
++    ap.add_argument("--sinopac-csv", default=None,
++                    help="永豐 CSV(預設自動找 sinopac*.csv);提供時台股改走 CSV 匯入,"
++                         "會解析現買/現賣/入金/配息")
++    ap.add_argument("--taiwan-live", action="store_true",
++                    help="強制台股走 run.py(永豐即時 API),即使找到 sinopac CSV")
+     ap.add_argument("--mock-taiwan", action="store_true", help="台股用 run.py --mock(假資料,免憑證)")
+     ap.add_argument("--skip-taiwan", action="store_true", help="完全跳過台股,只建美股")
+     args = ap.parse_args()
+@@ -70,6 +75,19 @@ def main() -> None:
+     db = args.db
+     schwab = find_csv(["schwab*.csv", "*Schwab*.csv", "*嘉信*.csv"], args.schwab_csv)
+     ibkr = find_csv(["*TRANSACTIONS*.csv", "U*_*.csv", "*ibkr*.csv", "*盈透*.csv"], args.ibkr_csv)
++    sinopac = find_csv(["sinopac*.csv", "*永豐*.csv"], args.sinopac_csv)
++    # 台股來源:有 sinopac CSV 且未強制 live/skip/mock → 走 CSV(含入金/配息);否則沿用 run.py
++    taiwan_via_csv = bool(sinopac) and not args.taiwan_live \
++        and not args.skip_taiwan and not args.mock_taiwan
++
++    if taiwan_via_csv:
++        tw_mode = f"CSV 匯入({sinopac})"
++    elif args.skip_taiwan:
++        tw_mode = "跳過"
++    elif args.mock_taiwan:
++        tw_mode = "假資料"
++    else:
++        tw_mode = "run.py(永豐憑證)"
+ 
+     print("=" * 64)
+     print("  從零重建 portfolio.db(台股 + 嘉信 + 盈透)")
+@@ -77,7 +95,7 @@ def main() -> None:
+     print(f"  目標 DB   : {db}")
+     print(f"  嘉信 CSV  : {schwab or '(找不到)'}")
+     print(f"  盈透 CSV  : {ibkr or '(找不到)'}")
+-    print(f"  台股模式  : {'跳過' if args.skip_taiwan else ('假資料' if args.mock_taiwan else 'run.py(永豐憑證)')}")
++    print(f"  台股模式  : {tw_mode}")
+ 
+     if not schwab:
+         print("\n✗ 找不到嘉信 CSV。請用 --schwab-csv 指定檔名。")
+@@ -91,8 +109,14 @@ def main() -> None:
+                 p.unlink()
+                 print(f"  已刪除舊檔:{f}")
+ 
+-    # 1) 建庫 + 台股 + 匯率(run.py 會建立含 fx_cache 的完整表結構)
+-    if args.skip_taiwan:
++    # 1) 建庫 + 台股 + 匯率(此步同時建立含 fx_cache 的完整表結構)
++    if taiwan_via_csv:
++        # 台股走 CSV:import_statements.py 會解析現買/現賣/入金/配息,
++        # 回放持倉、寫 transactions、並在偵測到入金時把重建現金寫進 broker_cash。
++        run_step([PY, "import_statements.py", sinopac, "--db", db],
++                 f"匯入台股對帳單(永豐 CSV:{sinopac})", essential=False)
++        ensure_db_schema(db)   # 確保 fx_cache 等表齊全(import 已建庫,這步為保險)
++    elif args.skip_taiwan:
+         ensure_db_schema(db)
+         print("  已跳過台股,僅建立空庫 + 表結構。")
+     else:
+@@ -100,7 +124,8 @@ def main() -> None:
+         ok = run_step(cmd, "建立資料庫 + 台股 + 匯率(run.py)", essential=False)
+         if not ok:
+             print("  台股步驟未成功 → 改為只建空庫表結構,繼續做美股(US-only)。")
+-            print("  若要含台股:確認 .env 永豐憑證後重跑,或加 --mock-taiwan。")
++            print("  若要含台股:確認 .env 永豐憑證後重跑,或加 --mock-taiwan,"
++                  "或放一份 sinopac.csv 走 CSV 匯入。")
+             ensure_db_schema(db)
+ 
+     # 2) 嘉信(merge 會自行抓六年 USD/TWD 匯率)
